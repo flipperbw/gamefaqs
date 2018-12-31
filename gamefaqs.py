@@ -26,7 +26,7 @@ sleep_delay = 0.5
 
 # PlayStation 4, Nintendo Switch, 3DS, DS, Wii, GameCube, PC, PlayStation 2, PlayStation, Nintendo 64, PSP, iOS (iPhone/iPad)
 # Dreamcast, PlayStation 3, PlayStation Vita, Wii U, Xbox, Xbox 360, Xbox One
-systems = ['PlayStation 4', 'Nintendo Switch']
+systems = ['Nintendo Switch', '3DS', 'DS', 'Wii', 'GameCube', 'PC',  'PlayStation 2', 'PlayStation', 'Nintendo 64', 'PSP', 'iOS (iPhone/iPad)']
 
 start_page = 0
 num_pages = False
@@ -506,8 +506,10 @@ def get_game_data(data_url, dlc=False):
             release_date = dateparse(release_date_text)
         except ValueError:
             print('-> Error: could not parse release date ({})'.format(release_date_text))
-            release_date = None
-        release_date_str = '{d.month}/{d.day:02}/{d.year}'.format(d=release_date)
+            release_date_str = None
+        else:
+            release_date_str = '{d.month}/{d.day:02}/{d.year}'.format(d=release_date)
+
         esrb_rating_r = rnext.find('td', {'class': "datarating"}).get_text(strip=True)
 
         this_release = {
@@ -525,7 +527,7 @@ def get_game_data(data_url, dlc=False):
 
         releases.append(this_release)
 
-        if not release_us and region == 'US' and all([publisher, product_id, release_date]):
+        if not release_us and region == 'US' and all([publisher, product_id, release_date_str]):
             release_us = this_release.copy()
             del release_us['region']
 
@@ -853,15 +855,16 @@ def parse_game_info(game_info, s=None):
 
     if game_len == '---' and s != 'iOS (iPhone/iPad)':
         print('-> Length is blank, skipping...')
-    else:
-        del game_info['glen']
-        game_details = get_game_details(game_href)
-        if game_details is False:
-            return False
-        game_info.update(game_details)
-        game_info['platform'] = s  # todo: remove and also name
+        return False
 
-        # print(json.dumps(game_info, indent=4, sort_keys=True))
+    del game_info['glen']
+    game_details = get_game_details(game_href)
+    if game_details is False:
+        return False
+    game_info.update(game_details)
+    game_info['platform'] = s  # todo: remove and also name
+
+    # print(json.dumps(game_info, indent=4, sort_keys=True))
 
     return game_info
 
@@ -1026,16 +1029,16 @@ def get_system_pages(s):
         max_page = main_body.select_one('ul.paginate')
         if max_page:
             last_page = int(max_page.get_text().strip().split('of ')[-1].split()[0])
-            print('Total pages: {}'.format(last_page))
         else:
             print('=> Error: Could not get max pages, using 1')
             last_page = 1
 
     print('= {} ='.format(s))
+    print(' Total pages: {}'.format(last_page))
     games_parsed = 0
 
     for i in range(start_page, last_page):
-        print('- Page {} -'.format(i))
+        print('- Page {} -'.format(i + 1))
         if i == 0:
             page_data = main_body
         else:
@@ -1110,6 +1113,8 @@ def get_one_page(url):
     }
 
     game_full_info = parse_game_info(game_info, s)
+    if game_full_info is False:
+        return
 
     update_game(game_full_info)
 
