@@ -7,12 +7,31 @@ import sys
 from time import sleep
 
 # noinspection PyProtectedMember
-from bs4 import BeautifulSoup, Comment, SoupStrainer
+from bs4 import (
+    #Comment,
+    SoupStrainer
+)
+import soupy
 from dateutil.parser import parse as dateparse
+#from pprint import pprint
 import psycopg2
-from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 import requests
+from sqlalchemy import inspect
+from sqlalchemy.orm.dynamic import AppenderQuery
+from termcolor import colored
+
+from sqla import (
+    session,
+    Developer,
+    Esrb_Content,
+    Game,
+    Game_Expansion,
+    Game_Stat,
+    Game_Release,
+    Game_Recommendation,
+    Game_Compilation
+)
 
 
 # -- GLOBALS --
@@ -20,24 +39,37 @@ import requests
 base_url = 'https://gamefaqs.gamespot.com'
 main_url = base_url + '/games/rankings?platform={system}&list_type=rate&dlc=0&min_votes={minvotes}'
 
-sleep_delay = 0.5
+sleep_delay = 0.34
 
 # -------------
 
 # PlayStation 4, Nintendo Switch, 3DS, DS, Wii, GameCube, PC, PlayStation 2, PlayStation, Nintendo 64, PSP, iOS (iPhone/iPad)
 # Dreamcast, PlayStation 3, PlayStation Vita, Wii U, Xbox, Xbox 360, Xbox One
-systems = ['Nintendo Switch', '3DS', 'DS', 'Wii', 'GameCube', 'PC',  'PlayStation 2', 'PlayStation', 'Nintendo 64', 'PSP', 'iOS (iPhone/iPad)']
+systems = ['PlayStation 4']
+#systems = [
+#    'PlayStation 4', 'Nintendo Switch', '3DS', 'DS', 'Wii', 'GameCube',
+#    'PC', 'PlayStation 2', 'PlayStation', 'Nintendo 64', 'PSP', 'iOS (iPhone/iPad)',
+#    'Dreamcast', 'PlayStation 3', 'PlayStation Vita', 'Wii U', 'Xbox', 'Xbox 360', 'Xbox One'
+#]
 
 start_page = 0
-num_pages = False
-# num_pages = 2
-max_games = None
-# max_games = 1
+#num_pages = False
+num_pages = 40
+#max_games = None
+max_games = 1
+
+rerun = True
+
+echo_changes = True
+do_commit = True
 
 db = psycopg2.connect(host="localhost", user="brett", password="", database="gamefaqs")
 cursor = db.cursor(cursor_factory=RealDictCursor)
 
 strainer = SoupStrainer('div', {'id': 'content'})
+
+# 1 = 50+, 2 = 5+ votes
+# todo: make all 1s
 
 system_dict = {
     '3DO': ('61', 2),
@@ -171,8 +203,8 @@ system_dict = {
 last_request = None
 
 headers = {'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36'}
-session = requests.Session()
-session.headers.update(headers)
+r_session = requests.Session()
+r_session.headers.update(headers)
 
 
 def wait_request(href):
@@ -187,19 +219,78 @@ def wait_request(href):
     if sleep_time > 0:
         sleep(sleep_time)
 
-    txt = session.get(href).text
+    txt = r_session.get(href).text
 
     last_request = datetime.now()
 
     return txt
 
 
+# todo: go through xtext and see if can set to default
+
+
+class XNode(soupy.Node):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def xtext(self, default=False):
+        t = self.text
+        if t:
+            return t.val().strip()
+        else:
+            if default:
+                return ''
+            else:
+                return None
+
+    def xget(self, key, default=None):
+        return self.attrs.val().get(key, default)
+
+    def select_one(self, selector):
+        value = self.select(selector)
+        return value[0]
+
+
+class XNullNode(soupy.NullNode):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def xtext(default=False):
+        if default:
+            return ''
+        else:
+            return None
+
+    @staticmethod
+    def xget(*_args, **_kwargs):
+        return None
+
+    def select_one(self, selector):
+        value = self.select(selector)
+        return value[0]
+
+
+soupy.Node = XNode
+soupy.NullNode = XNullNode
+
+
 def clean_soup(soup):
     for script in soup(["script", "link", "style", "noscript", "meta"]):
-        script.extract()
-    for x in soup.find_all(text=lambda text: isinstance(text, Comment)):
-        x.extract()
+        script.val().extract()
+    #for comment in soup.find_all(text=lambda t: isinstance(t, Comment)):
+    #    comment.val().extract()
+    for bad in soup.select('#mygames_nouser_dialog'):
+        bad.val().extract()
     return soup
+
+
+def get_soup(url):
+    if not url:
+        return soupy.Soupy('', 'lxml')
+    d = wait_request(url)
+    soup = clean_soup(soupy.Soupy(d, 'lxml', parse_only=strainer))
+    return soup.find('div', attrs={'class': 'main_content'})
 
 
 def get_new_page(i, system_url):
@@ -208,47 +299,25 @@ def get_new_page(i, system_url):
     else:
         sys_page = system_url
 
-    d = wait_request(sys_page)
-    soup = clean_soup(BeautifulSoup(d, 'lxml', parse_only=strainer))
-    main_body = soup.find('div', {'class': 'main_content'})
-
-    return main_body
+    return get_soup(sys_page)
 
 
-def get_game_details(href):
-    data_url = href + '/data'
-    stats_url = href + '/stats'
-    playing_url = href + '/playing'
-
-    game_data = get_game_data(data_url)
-    if game_data is False:
-        return False
-    game_stats = get_game_stats(stats_url)
-    game_playing = get_game_playing(playing_url)
-
-    all_details = {}
-    all_details.update(game_data)
-    all_details.update(game_stats)
-    all_details.update(game_playing)
-
-    return all_details
+def get_game_id(url):
+    return int(url.split('/')[-1].split('-')[0])
 
 
-def get_game_id(href):
-    return int(href.split('/')[-1].split('-')[0])
-
-
-def add_base_url(href):
-    if not href:
+def add_base_url(url):
+    if not url:
         return None
-    if base_url not in href:
-        href = base_url + href
-    return href
+    if base_url not in url:
+        url = base_url + url
+    return url
 
 
 re_comp = {
     'genre': re.compile(r'^Genre'),
     'developer': re.compile(r'^Developer'),
+    'wiki': re.compile(r'^Wikipedia \(EN\):'),
     'esrb': re.compile(r'^ESRB Descriptor'),
     'release': re.compile(r'^Release:'),
     'franchise': re.compile(r'^Franchise:'),
@@ -261,759 +330,928 @@ re_comp = {
 }
 
 
-def get_game_data(data_url, dlc=False):
-    g_data = get_new_page(False, data_url)
+def get_changes():
+    print('-> New')
+    for obj in session.new:
+        o_type = obj.__class__.__name__.lower()
+        print('  {}'.format(o_type))
+        #for attr in inspect(obj).attrs:
+        #    if attr.history.has_changes():
+        #        print('  {}: "{}" to "{}"'.format(attr.key, attr.history.deleted, attr.history.added))
 
-    if dlc is True:
-        # - Header - #
+    print('-> Deleted')
+    for obj in session.deleted:
+        o_type = obj.__class__.__name__.lower()
+        print('  {}: {}'.format(o_type, obj.id))
 
-        name = None
-        game_title = g_data.select_one('header.page-header .page-title a')
-        if game_title:
-            name = game_title.get_text(strip=True)
+    print('-> Changes')
+    for obj in session.dirty:
+        o_type = obj.__class__.__name__.lower()
+        print('  {}: {}'.format(o_type, obj.id))
+        for attr in inspect(obj).attrs:
+            if attr.history.has_changes():
+                print('    {}: deleted "{}" and added "{}"'.format(attr.key, attr.history.deleted, attr.history.added))
 
-        # - Upper Right Data - #
+    session.flush()
 
-        more_data = g_data.find('div', {'class': 'pod_gameinfo'}).find('div', {'class': 'body'}).find('ul')
 
-        release_date_str = None
-        release_date_b = more_data.find('b', text=re_comp.get('release'))
-        if release_date_b:
-            release_date_a = release_date_b.find_next_sibling('a')
-            release = release_date_a.get_text(strip=True)
-            release = re.sub(re_comp.get('quarters'), '', release)
+def get_game_details(db_game):
+    p = Parser(db_game)
+    p.update_all()
+    #pprint(vars(p.obj))
 
-            if release.endswith(' »'):
-                release = release.replace(' »', '').replace('  ', ' ')
-            try:
-                release_date = dateparse(release)
-            except ValueError:
-                print('-> Error: could not parse release date ({}) for DLC: {}'.format(release, data_url))
+    return p
+
+
+def commit(p):
+    if p.is_valid:
+        session.add(p.obj)
+        p.commit()
+
+
+class Parser:
+    def __init__(self, obj):
+        self.obj = obj
+        self.is_valid = True
+        self.is_dlc = isinstance(obj, Game_Expansion)
+
+        self._set_soup()
+
+    @staticmethod
+    def _log(t, e='yellow'):
+        if e:
+            print(colored(t, e))
+        else:
+            print(t)
+        return None
+
+    def _get_url(self, typ):
+        if self.is_dlc:
+            if typ in ('main', 'data'):
+                return self.obj.url
             else:
-                release_date_str = '{d.month}/{d.day:02}/{d.year}'.format(d=release_date)
+                return None
+        else:
+            if typ == 'main':
+                return None
+            else:
+                return '{}/{}'.format(self.obj.url, typ)
 
-        metacritic = {}
-        metacritic_b = more_data.find('li', {'class': 'metacritic'})
-        if metacritic_b:
-            metacritic['rating'] = int(metacritic_b.find('div', {'class': 'score'}).get_text(strip=True))
-            metacritic_rev = metacritic_b.find('div', {'class': 'review_link'})
-            metacritic_a = metacritic_rev.find('a')
-            metacritic['url'] = metacritic_a.get('href')
-            metacritic['reviews'] = int(metacritic_a.get_text(strip=True).replace('From ', '').replace(' reviews', '').replace(' review', ''))
-
-        esrb_rating = None
-        esrb_rating_b = more_data.find('span', {'class': 'esrb_logo'})
-        if esrb_rating_b:
-            esrb_rating = esrb_rating_b.get_text(strip=True).replace(' - ', '').replace(' -', '')
-
-        # - Middle Data - #
-
-        description = None
-        desc_div = g_data.select_one('div.pod_gamespace .game_desc .desc')
-        if desc_div:
-            description = desc_div.get_text(strip=True)
-
-        ownership_num = None
-        rating = {}
-        difficulty = {}
-        playtime = {}
-        completed = {}
-
-        overview_data = g_data.select_one('form#js_mygames .pod_split .body')
-        if overview_data:
-            ownership_div = overview_data.select_one('.mygames_stats_own a')
-            if ownership_div:
-                ownership_num = int(ownership_div.get_text(strip=True).replace(' users', '').replace(' user', ''))
-
-            rating_div = overview_data.select_one('.mygames_rate .gamerater_label')
-            if rating_div:
-                score_div = rating_div.select_one('.mygames_stats_rate a')
-                if score_div:
-                    rating['avg'] = float(score_div.get_text(strip=True).split(' ')[0])
-                num_rate_div = rating_div.select_one('.rate')
-                if num_rate_div:
-                    rating['total'] = int(num_rate_div.get_text(strip=True).split(' ')[0])
-
-            difficulty_div = overview_data.select_one('.mygames_diff .gamerater_label')
-            if difficulty_div:
-                difficulty_desc_div = difficulty_div.select_one('.mygames_stats_diff a')
-                if difficulty_desc_div:
-                    difficulty['desc'] = difficulty_desc_div.get_text(strip=True)
-                difficulty_num_div = difficulty_div.select_one('.rate')
-                if difficulty_num_div:
-                    diff_num_spl = difficulty_num_div.get_text(strip=True).split(' ')
-                    diff_num_spl = [v for v in diff_num_spl if v not in ('of', 'total', 'votes')]
-                    if len(diff_num_spl) == 2:
-                        difficulty['pct'] = round(float(diff_num_spl[0].replace('%', '')) / 100.0, 6)
-                        difficulty['votes'] = int(diff_num_spl[1])
-
-            playtime_div = overview_data.select_one('.mygames_time .gamerater_label')
-            if playtime_div:
-                playtime_len_a = playtime_div.select_one('.mygames_stats_time a')
-                if playtime_len_a:
-                    playtime_len_str = playtime_len_a.get_text(strip=True).replace(' hours', '').replace(' hour', '')
-                    if '80+' in playtime_len_str:
-                        playtime_len_str = 90
-                    try:
-                        playtime_len = float(playtime_len_str)
-                    except ValueError:
-                        print('-> Error: could not convert playtime for DLC: {}'.format(data_url))
-                    else:
-                        playtime['len'] = playtime_len
-                playtime_num_div = playtime_div.select_one('.rate')
-                if playtime_num_div:
-                    playtime['total'] = int(playtime_num_div.get_text(strip=True).split(' ')[0])
-
-            completed_div = overview_data.select_one('.mygames_play .gamerater_label .rate')
-            if completed_div:
-                complted_div_spl = completed_div.get_text(strip=True).split(' ')
-                complted_div_spl = [v for v in complted_div_spl if v not in ('of', 'total', 'votes')]
-                if len(complted_div_spl) == 2:
-                    completed['pct'] = round(float(complted_div_spl[0].replace('%', '')) / 100.0, 6)
-                    completed['votes'] = int(complted_div_spl[1])
-
-        game_id = get_game_id(data_url)
-
-        exp_data = {
-            'href': data_url,
-            'game_id': game_id,
-            'name': name,
-            'release_date': release_date_str,
-            'metacritic': metacritic,
-            'esrb_rating': esrb_rating,
-            'description': description,
-            'ownership_num': ownership_num,
-            'rating': rating,
-            'difficulty': difficulty,
-            'playtime': playtime,
-            'completed': completed
+    def _set_soup(self):
+        self.soup_main = {
+            'main': get_soup(self._get_url('main'))
+        }
+        self.soup_data = {
+            'main': get_soup(self._get_url('data'))
+        }
+        self.soup_stats = {
+            'main': get_soup(self._get_url('stats'))
+        }
+        self.soup_recommendations = {
+            'main': get_soup(self._get_url('playing'))
         }
 
-        return exp_data
+    def _setif(self, k, v, obj=None):
+        if obj is None:
+            obj = self.obj
+        if v is not None:
+            if hasattr(obj, k):
+                old = getattr(obj, k)
+                if isinstance(old, AppenderQuery):
+                    old = set(old.all())
+                    comp_v = set(v)
+                else:
+                    comp_v = v
+                if comp_v != old:
+                    setattr(obj, k, v)
+            else:
+                self._log('-> Error: Attribute does not exist ({}) for ({})'.format(k, obj), 'red')
 
-    # - More Data - #
+    def _setdictif(self, d, o=None):
+        for k, v in d.items():
+            self._setif(k, v, o)
 
-    more_data = g_data.find('div', {'class': 'pod_gameinfo'}).find('div', {'class': 'body'}).find('ul')
+    def update_all(self):
+        #TODO: create a class for expansion and regular game
+        if self.is_dlc:
+            # TODO: add boxart
+            self._soup_data_upper_right()
+            self.update_main()
+        else:
+            self._soup_data_upper_right()
+            if self._check_expansion() is None:
+                self.is_valid = False
+                return
+            
+            self.update_data()
+            self.update_stats()
+            self.update_recommendations()
 
-    expansion_b = more_data.find('b', text=re_comp.get('expansion'))
-    if expansion_b:
-        print('=> Error: is DLC, skipping...')
-        return False
+    # TODO: passing words to find makes a soupstrainer every time, better to compile
 
-    boxart = {}
-    boxart_b = more_data.find('img', {'class': 'boxshot'})
-    if boxart_b:
-        thumb_src = boxart_b.get('src')
-        boxart['thumb'] = thumb_src
-        boxart['front'] = thumb_src.replace('thumb.', 'front.')  # todo: check if exists
-    boxart_c = more_data.find('a', {'class': 'imgboxart'})
-    if boxart_c:
-        bhref = boxart_c.get('href')
-        boxart['all'] = add_base_url(bhref)
+    def update_main(self):  # only for dlc right now
+        self._setif('name', self.name())
+        self._setif('description', self.description())
 
-    franchise = {}
-    franchise_b = more_data.find('b', text=re_comp.get('franchise'))
-    if franchise_b:
-        franchise_a = franchise_b.find_next_sibling('a')
-        franchise['name'] = franchise_a.get_text(strip=True)
-        fhref = franchise_a.get('href')
-        franchise['url'] = add_base_url(fhref)
+        self._setif('release_date', self.release_date())
+        self._setdictif(self.metacritic())
+        self._setif('esrb_rating', self.esrb_rating())
 
-    # todo get system aliases
-    alsoon = []
-    alsoon_b = more_data.find('b', text=re_comp.get('also'))
-    if alsoon_b:
-        alsoon_as = alsoon_b.find_next_siblings()
-        alsoon = [a.get_text(strip=True) for a in alsoon_as]
+        self.soup_main['overview'] = self.soup_main['main'].select_one('form#js_mygames .pod_split .body')
 
-    aka = None
-    aka_b = more_data.find('b', text=re_comp.get('aka'))
-    if aka_b:
-        aka_a = aka_b.find_next_sibling('i')
-        aka = aka_a.get_text(strip=True)
-        # todo: multiple?
-        # todo: combine this somehow
+        self._setif('owners', self.owners_overview())
 
-    metacritic = {}
-    metacritic_b = more_data.find('li', {'class': 'metacritic'})
-    if metacritic_b:
-        metacritic['rating'] = int(metacritic_b.find('div', {'class': 'score'}).get_text(strip=True))
-        metacritic_rev = metacritic_b.find('div', {'class': 'review_link'})
-        metacritic_a = metacritic_rev.find('a')
-        metacritic['url'] = metacritic_a.get('href')
-        metacritic['reviews'] = int(metacritic_a.get_text(strip=True).replace('From ', '').replace(' reviews', '').replace(' review', ''))
+        self._setdictif(self.rating_overview())
+        self._setdictif(self.difficulty_overview())
+        self._setdictif(self.playtime_overview())
+        self._setdictif(self.completed_overview())
 
-    # - Data - #
+    def _soup_data_upper_right(self):
+        self.soup_data['up_right'] = self.soup_data['main'].find('div', {'class': 'pod_gameinfo'}).find('div', {'class': 'body'}).find('ul')
 
-    general_data = g_data.find('div', {'class': 'pod_titledata'}).find('div', {'class': 'body'}).find('dl')
+    def name(self):
+        return self.soup_data['main'].select_one('header.page-header .page-title a').xtext()
 
-    genre = None
-    genre_b = general_data.find('dt', text=re_comp.get('genre'))
-    if genre_b:
-        genre = genre_b.find_next_sibling('dd').get_text(strip=True)
+    def description(self):
+        return self.soup_data['main'].select_one('div.pod_gamespace .game_desc .desc').xtext()
 
-    developers = {}
-    developer_bs = general_data.find_all('dt', text=re_comp.get('developer'))
-    for developer_b in developer_bs:
-        developer_data = developer_b.find_next_sibling('dd')
+    def release_date(self):
+        release = self.soup_data['up_right'].find('b', text=re_comp.get('release')).find_next_sibling('a').xtext()
+        if release is None:
+            return None
 
-        developer_name = developer_data.get_text(strip=True)
+        release = re.sub(re_comp.get('quarters'), '', release)
+        if release.endswith(' »'):
+            release = release.replace(' »', '').replace('  ', ' ')
 
-        developer_url = None
-        dev_a = developer_data.find('a')
-        if dev_a:
-            dhref = dev_a.get('href')
-            developer_url = add_base_url(dhref)
-
-        developers[developer_name] = developer_url
-
-    esrb_description = []
-    esrb_b = general_data.find('dt', text=re_comp.get('esrb'))
-    if esrb_b:
-        esrb_description = [ed.strip() for ed in esrb_b.find_next_sibling('dd').get_text(strip=True).split(',')]
-
-    local_players = None
-    local_players_b = general_data.find('dt', text=re_comp.get('local_players'))
-    if local_players_b:
-        local_players = local_players_b.find_next_sibling('dd').get_text(strip=True)
-
-    multi_players = None
-    multi_players_b = general_data.find('dt', text=re_comp.get('multi_players'))
-    if multi_players_b:
-        multi_players = multi_players_b.find_next_sibling('dd').get_text(strip=True)
-
-    # - Releases - #
-
-    release_data = g_data.find('table', {'class': 'contrib'}).find('tbody').find_all('tr')
-
-    releases = []
-    release_us = {}
-
-    for r in release_data[::2]:
-        r_title = r.find('td', {'class': 'ctitle'}).get_text(strip=True)
-
-        rnext = r.nextSibling
-        region = rnext.find('td', {'class': 'cregion'}).get_text(strip=True)
-        publisher_b = rnext.find('td', {'class': "datacompany"}).find('a')
-        publisher = publisher_b.get_text(strip=True)
-        publisher_url = add_base_url(publisher_b.get('href'))
-        product_ids = rnext.find_all('td', {'class': "datapid"})
-        product_id = product_ids[0].get_text(strip=True)
-        distribution = product_ids[1].get_text(strip=True)
-        release_date_text = rnext.find('td', {'class': "cdate"}).get_text(strip=True)
-        release_date_text = re.sub(re_comp.get('quarters'), '', release_date_text)
         try:
-            release_date = dateparse(release_date_text)
+            release_date = dateparse(release)
         except ValueError:
-            print('-> Error: could not parse release date ({})'.format(release_date_text))
-            release_date_str = None
+            return self._log('-> Error: could not parse release date ({})'.format(release))
         else:
-            release_date_str = '{d.month}/{d.day:02}/{d.year}'.format(d=release_date)
+            return release_date.date()
 
-        esrb_rating_r = rnext.find('td', {'class': "datarating"}).get_text(strip=True)
+    def metacritic(self):
+        v = {}
+        data = self.soup_data['up_right'].find('li', {'class': 'metacritic'})
 
-        this_release = {
-            'title': r_title,
-            'region': region,
-            'publisher': {
-                'name': publisher,
-                'url': publisher_url
-            },
-            'product_id': product_id,
-            'distribution_id': distribution,
-            'release_date': release_date_str,
-            'esrb_rating': esrb_rating_r
+        rating = data.find('div', {'class': 'score'}).xtext()
+        if rating is not None:
+            v['metacritic_rating'] = int(rating)
+
+        metacritic_a = data.find('div', {'class': 'review_link'}).find('a')
+
+        url = metacritic_a.xget('href')
+        if url is not None:
+            v['metacritic_url'] = url
+
+        reviews = metacritic_a.xtext()
+        if reviews is not None:
+            v['metacritic_reviews'] = int(reviews.replace('From ', '').replace(' reviews', '').replace(' review', ''))
+
+        return v
+
+    def esrb_rating(self):
+        v = self.soup_data['up_right'].find('span', {'class': 'esrb_logo'}).xtext()
+        if v is not None:
+            v = v.replace(' - ', '').replace(' -', '')
+        return v
+
+    def owners_overview(self):
+        v = self.soup_main['overview'].select_one('.mygames_stats_own a').xtext()
+        if v is not None:
+            v = int(v.replace(' users', '').replace(' user', ''))
+        return v
+
+    def rating_overview(self):
+        v = {}
+
+        rating_div = self.soup_main['overview'].select_one('.mygames_rate .gamerater_label')
+
+        score_div = rating_div.select_one('.mygames_stats_rate a').xtext()
+        if score_div is not None:
+            v['rating_score'] = float(score_div.split(' ')[0])
+
+        num_rate_div = rating_div.select_one('.rate').xtext()
+        if num_rate_div is not None:
+            v['rating_votes'] = int(num_rate_div.split(' ')[0])
+
+        return v
+
+    def difficulty_overview(self):
+        v = {}
+
+        difficulty_div = self.soup_main['overview'].select_one('.mygames_diff .gamerater_label')
+
+        difficulty_desc_div = difficulty_div.select_one('.mygames_stats_diff a').xtext()
+        if difficulty_desc_div is not None:
+            v['difficulty_desc'] = difficulty_desc_div
+
+        difficulty_num_div = difficulty_div.select_one('.rate').xtext()
+        if difficulty_num_div is not None:
+            diff_num_spl = [i for i in difficulty_num_div.split(' ') if i not in ('of', 'total', 'votes')]
+            if len(diff_num_spl) == 2:
+                v['difficulty_pct'] = round(float(diff_num_spl[0].replace('%', '')) / 100.0, 6)
+                v['difficulty_votes'] = int(diff_num_spl[1])
+
+        return v
+
+    def playtime_overview(self):
+        v = {}
+
+        playtime_div = self.soup_main['overview'].select_one('.mygames_time .gamerater_label')
+
+        playtime_len_a = playtime_div.select_one('.mygames_stats_time a').xtext()
+        if playtime_len_a is not None:
+            playtime_len_str = playtime_len_a.replace(' hours', '').replace(' hour', '')
+            if '80+' in playtime_len_str:
+                playtime_len_str = 90
+            try:
+                playtime_len = float(playtime_len_str)
+            except ValueError:
+                self._log('-> Error: could not convert playtime ({})'.format(playtime_len_str))
+            else:
+                v['playtime_hours'] = playtime_len
+
+        playtime_num_div = playtime_div.select_one('.rate').xtext()
+        if playtime_num_div is not None:
+            v['playtime_votes'] = int(playtime_num_div.split(' ')[0])
+
+        return v
+
+    def completed_overview(self):
+        v = {}
+
+        completed_div = self.soup_main['overview'].select_one('.mygames_play .gamerater_label .rate').xtext()
+        if completed_div is not None:
+            complted_div_spl = [v for v in completed_div.split(' ') if v not in ('of', 'total', 'votes')]
+            if len(complted_div_spl) == 2:
+                v['completed_pct'] = round(float(complted_div_spl[0].replace('%', '')) / 100.0, 6)
+                v['completed_votes'] = int(complted_div_spl[1])
+
+        return v
+
+    def update_data(self):
+        self._setdictif(self.boxart())
+        self._setdictif(self.franchise())
+        self._setif('also_on', self.also_on())
+        self._setif('aka', self.aka())
+
+        self._setif('metacritic_url', self.metacritic().get('metacritic_url'))
+
+        self.soup_data['general'] = self.soup_data['main'].find('div', {'class': 'pod_titledata'}).find('div', {'class': 'body'}).find('dl')
+
+        self._setif('genre', self.genre())
+        self._setif('local_players', self.local_players())
+        self._setif('multi_players', self.multi_players())
+        self._setif('wiki', self.wiki())
+        self._setif('developers', self.developers())
+        self._setif('esrb_contents', self.esrb_contents())
+
+        release_list = self.releases()
+        if release_list:
+            for rel in self.obj.game_releases:
+                if rel not in release_list:
+                    session.delete(rel)
+        self._setif('game_releases', release_list)
+
+        self._setdictif(self._release_us(release_list))
+
+        comp_list = self.compilations()
+        if comp_list:
+            for com in self.obj.game_compilations:
+                if com not in comp_list:
+                    session.delete(com)
+        self._setif('game_compilations', comp_list)
+
+        exp_list = self.expansions()
+        if exp_list:
+            for exp in self.obj.game_expansions:
+                if exp not in exp_list:
+                    session.delete(exp)
+        self._setif('game_expansions', exp_list)
+
+        # TODO: make sure soups are set first
+        
+        #TODO: function replacing if X is none...
+
+    def _check_expansion(self):
+        expansion_b = self.soup_data['up_right'].find('b', text=re_comp.get('expansion'))
+        if expansion_b:
+            return self._log('=> Error: is DLC, skipping...', 'magenta')
+        else:
+            return True
+
+    def boxart(self):
+        v = {}
+
+        boxart_b = self.soup_data['up_right'].find('img', {'class': 'boxshot'}).xget('src')
+        if boxart_b is not None and 'akamaized.net/images/platform-' not in boxart_b:
+            v['boxart_thumb'] = boxart_b
+            v['boxart_front'] = boxart_b.replace('thumb.', 'front.')  # todo: check if exists
+
+            boxart_c = self.soup_data['up_right'].find('a', {'class': 'imgboxart'}).xget('href')
+            if boxart_c is not None:
+                v['boxart_all'] = add_base_url(boxart_c)
+
+        return v
+
+    def franchise(self):
+        v = {}
+
+        franchise_b = self.soup_data['up_right'].find('b', text=re_comp.get('franchise')).find_next_sibling('a')
+        f_txt = franchise_b.xtext()
+        if f_txt is not None:
+            v['franchise_name'] = f_txt
+        fhref = franchise_b.xget('href')
+        if fhref is not None:
+            v['franchise_url'] = add_base_url(fhref)
+
+        return v
+
+    def also_on(self):
+        # todo get system aliases
+        alsoon = None
+        alsoon_b = self.soup_data['up_right'].find('b', text=re_comp.get('also')).find_next_siblings()
+        if alsoon_b:
+            alsoon = [a.xtext() for a in alsoon_b]
+
+        return alsoon
+
+    def aka(self):
+        # todo: multiple? (they are split on commas, but the string contains commas anyway
+        # todo: combine this somehow
+        return self.soup_data['up_right'].find('b', text=re_comp.get('aka')).find_next_sibling('i').xtext()
+
+    def genre(self):
+        return self.soup_data['general'].find('dt', text=re_comp.get('genre')).find_next_sibling('dd').xtext()
+    
+    def local_players(self):
+        return self.soup_data['general'].find('dt', text=re_comp.get('local_players')).find_next_sibling('dd').xtext()
+
+    def multi_players(self):
+        return self.soup_data['general'].find('dt', text=re_comp.get('multi_players')).find_next_sibling('dd').xtext()
+
+    def wiki(self):
+        return self.soup_data['general'].find('dt', text=re_comp.get('wiki')).find_next_sibling('dd').xtext()
+
+    def developers(self):
+        v = []
+
+        developer_bs = self.soup_data['general'].find_all('dt', text=re_comp.get('developer')).orelse([])
+        for developer_b in developer_bs:
+            developer_data = developer_b.find_next_sibling('dd')
+
+            developer_name = developer_data.xtext()
+            if not developer_name:
+                continue
+
+            if developer_name in developer_list:
+                dev_obj = developer_list[developer_name]
+            else:
+                developer_url = developer_data.find('a').xget('href')
+                if not developer_url:
+                    continue
+
+                developer_url = add_base_url(developer_url)
+
+                dev_obj = Developer(name=developer_name, url=developer_url)
+
+                developer_list[developer_name] = dev_obj
+
+            v.append(dev_obj)
+
+        return v
+
+    def esrb_contents(self):
+        v = []
+
+        esrb_b = self.soup_data['general'].find('dt', text=re_comp.get('esrb')).find_next_sibling('dd').xtext()
+        if esrb_b is not None:
+            for ec in esrb_b.split(','):
+                ec_name = ec.strip()
+
+                if ec_name in esrb_content_list:
+                    ec_obj = esrb_content_list[ec_name]
+                else:
+                    ec_obj = Esrb_Content(name=ec_name)
+
+                    esrb_content_list[ec_name] = ec_obj
+
+                v.append(ec_obj)
+
+        return v
+
+    def releases(self):
+        release_data = self.soup_data['main'].find('table', {'class': 'contrib'}).find('tbody').find_all('tr').orelse([])
+    
+        v = []
+        existing = self.obj.game_releases
+
+        for r in release_data[::2]:
+            r_title = r.find('td', {'class': 'ctitle'}).xtext()
+
+            rnext = r.find_next_sibling()
+
+            region = rnext.find('td', {'class': 'cregion'}).xtext()
+
+            publisher_b = rnext.find('td', {'class': "datacompany"}).find('a')
+            publisher = publisher_b.xtext()
+            if publisher is None:
+                publisher_url = None
+            else:
+                publisher_url = add_base_url(publisher_b.xget('href'))
+
+            product_ids = rnext.find_all('td', {'class': "datapid"})
+            product_id = product_ids[0].xtext()
+            distribution = product_ids[1].xtext()
+
+            release_date_text = rnext.find('td', {'class': "cdate"}).xtext()
+            release_date = None
+            if release_date_text is not None:
+                release_date_text = re.sub(re_comp.get('quarters'), '', release_date_text)
+                try:
+                    release_date = dateparse(release_date_text)
+                except ValueError:
+                    self._log('-> Error: could not parse release date ({})'.format(release_date_text))
+
+            esrb_rating_r = rnext.find('td', {'class': "datarating"}).xtext()
+
+            rel_dict = {
+                'region': region,
+                'title': r_title,
+                'publisher_name': publisher,
+                'publisher_url': publisher_url,
+                'product_uid': product_id,
+                'distribution_uid': distribution,
+                'release_date': release_date,
+                'esrb_rating': esrb_rating_r
+            }
+
+            filtered = existing.filter_by(**rel_dict)
+            filtered_len = filtered.count()
+            if filtered_len == 0:
+                release_obj = Game_Release()
+                self._setdictif(rel_dict, release_obj)
+            else:
+                release_obj = filtered.first()
+                if filtered_len > 1:
+                    self._log('-> Error: found more than one entry for existing releases in db, using ID {}'.format(release_obj.id), 'red')
+
+            v.append(release_obj)
+
+        return v
+
+    @staticmethod
+    def _release_us(rels=()):
+        for rel in rels:
+            if rel.region == 'US' and all([rel.publisher_name, rel.product_uid, rel.release_date]):
+                # todo only set nonnull
+                return {
+                    'release_distribution_uid': rel.distribution_uid,
+                    'release_product_uid': rel.product_uid,
+                    'release_publisher_name': rel.publisher_name,
+                    'release_publisher_url': rel.publisher_url,
+                    'release_date': rel.release_date,
+                    'release_esrb_rating': rel.esrb_rating,
+                    'release_title': rel.title
+                }
+
+        return {}
+
+    def compilations(self):
+        comp_dict = {
+            'Included in Compilation': 'within',
+            'Compilation Of': 'contains'
         }
 
-        releases.append(this_release)
+        v = []
+        existing = self.obj.game_compilations
 
-        if not release_us and region == 'US' and all([publisher, product_id, release_date_str]):
-            release_us = this_release.copy()
-            del release_us['region']
+        for comp_type, comp_name in comp_dict.items():
+            compl_included = self.soup_data['main'].find('h2', text=comp_type).parent.find_next_sibling('div', {'class': 'body'}).find_all('tr').orelse([])
+            for tr in compl_included:
+                tds = tr.find_all('td')
+                if len(tds) >= 2:
+                    c_game = tds[0].find('a')
+                    c_game_name = c_game.xtext()
+                    c_game_link = c_game.xget('href')
+                    if c_game_link is not None:
+                        c_game_link = add_base_url(c_game_link).lower()
+                    c_plat = tds[1].xtext()
 
-    # - Append all the data -#
+                    filter_dict = {
+                        'typ': comp_name,
+                        'name': c_game_name,
+                        'platform': c_plat,
+                        'url': c_game_link,
+                    }
 
-    game_data = {
-        'genre': genre,
-        'developers': developers,
-        'esrb_descriptions': esrb_description,
-        'boxart': boxart,
-        'franchise': franchise,
-        'also_on': alsoon,
-        'metacritic': metacritic,
-        'release_us': release_us,
-        'releases': releases,
-        'local_players': local_players,
-        'multi_players': multi_players,
-        'aka': aka
-    }
+                    filtered = existing.filter_by(url=c_game_link)
+                    filtered_len = filtered.count()
+                    if filtered_len == 0:
+                        comp_obj = Game_Compilation()
+                        self._setdictif(filter_dict, comp_obj)
+                    else:
+                        comp_obj = filtered.first()
+                        if filtered_len > 1:
+                            self._log('-> Error: found more than one entry for existing compilations in db, using ID {}'.format(comp_obj.id), 'red')
 
-    # - Expansions - #
+                    v.append(comp_obj)
 
-    expansion_data = {}
-    expansion_div = g_data.find('div', {'id': 'dlc'})
-    if expansion_div:
-        expansion_trs = expansion_div.select('.body table tr')
+        return v
+
+    def expansions(self):
+        v = []
+        existing = self.obj.game_expansions
+
+        expansion_trs = self.soup_data['main'].find('div', {'id': 'dlc'}).select('.body table tr').orelse([])
         for tr in expansion_trs:
-            cell_data = tr.find_all('td')[0]
-            cell_a = cell_data.find('a')
-            game_href = add_base_url(cell_a.get('href'))
-            game_name = cell_a.get_text(strip=True)
+            cell_a = tr.select_one('td a')
+            game_href = cell_a.xget('href')
+            if game_href is None:
+                self._log('No URL found for expansion: {}'.format(cell_a.xtext()))
+                continue
 
-            expansion_info = get_game_data(game_href, dlc=True)
+            game_href = add_base_url(game_href)
 
-            expansion_data[game_name] = expansion_info
+            filtered = existing.filter_by(url=game_href)
+            filtered_len = filtered.count()
+            if filtered_len == 0:
+                exp_obj = Game_Expansion(url=game_href)
+                set_dict = {
+                    'name': cell_a.xtext(),
+                    'gamefaqs_uid': get_game_id(game_href)
+                }
+                self._setdictif(set_dict, exp_obj)
+                get_game_details(exp_obj)
+            else:
+                exp_obj = filtered.first()
+                if filtered_len > 1:
+                    self._log('-> Error: found more than one entry for existing compilations in db, using ID {}'.format(exp_obj.id), 'red')
 
-    # - Return all - #
+                if rerun is False:
+                    self._log('-> Exists, skipping insert for dlc ({})'.format(game_href), '')
+                else:
+                    self._log('-> Found dlc entry, now rerunning ({})'.format(game_href), '')
+                    get_game_details(exp_obj)
 
-    game_data_all = {
-        'data': game_data,
-        'expansions': expansion_data
-    }
+            v.append(exp_obj)
 
-    return game_data_all
+        return v
 
+    def update_stats(self):
+        # todo: ADD INSTDEV to all
+        existing = self.obj.game_stats
+        o = None
+        if existing.count():
+            if rerun is False:
+                return self._log('-> Stats exists, skipping insert for ({})'.format(self.obj.url), '')
+            else:
+                self._log('-> Found stats entry, now rerunning ({})'.format(self.obj.url), '')
+                o = existing.first()
 
-def get_game_stats(data_url):
-    # todo: ADD INSTDEV to all
-    g_stats = get_new_page(False, data_url)
+        self.soup_stats['figure'] = self.soup_stats['main'].find_all('figure', {'class': 'mygames_section bar'})
+        len_stats = len(self.soup_stats['figure'])
+        if len_stats != 5:
+            return self._log(colored('-> Error: could not find stats: {} sections'.format(len_stats)))
 
-    stats_data = g_stats.find_all('figure', {'class': 'mygames_section bar'})
-    if len(stats_data) != 5:
-        print('-> Error: could not find stats: {}'.format(len(stats_data)))
-        return {'stats': {}}
+        if o is None:
+            o = Game_Stat()
 
-    # - Ratings -#
+        self._setdictif(self.ratings(), o)
+        self._setif('owners', self.ownership(), obj=o)
+        self._setdictif(self.progress(), o)
+        self._setdictif(self.difficulty(), o)
+        self._setdictif(self.playtime(), o)
 
-    rating_section = stats_data[0]
-    total_ratings = rating_section.find('figcaption').get_text(strip=True)
-    num_ratings_tot = int(total_ratings[total_ratings.index(":") + 2: total_ratings.index("-") - 1])
+        self._setif('game_stats', [o])
 
-    ratings = {}
-    avg_rating = 0.0
-    terrible_pct = 0.0
-    amazing_pct = 0.0
+    def ratings(self):
+        #todo combine these similar ones
+        v = {}
 
-    tbody = rating_section.find('tbody')
-    for i in range(1, 11):
-        stars = i / 2.0
-        dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
-        if dataspan:
-            datapoint = float(dataspan.findChild('span').get_text(strip=True).replace('%', '')) / 100.0
-        else:
-            datapoint = 0.0
+        rating_section = self.soup_stats['figure'][0]
 
-        conv_rating = datapoint * stars
+        num_ratings_tot = rating_section.find('figcaption').xtext()
+        if num_ratings_tot is not None:
+            num_ratings_tot = int(num_ratings_tot[num_ratings_tot.index(":") + 2: num_ratings_tot.index("-") - 1])
 
-        ratings[str(stars)] = round(datapoint, 6)
-        avg_rating += conv_rating
+        avg_rating = 0.0
+        terrible_pct = 0.0
+        amazing_pct = 0.0
 
-        if i in (1, 2):
-            terrible_pct += datapoint
-        elif i in (9, 10):
-            amazing_pct += datapoint
+        star_dict = {
+            '0.5': 'half',
+            '1.0': 'one',
+            '1.5': 'one_half',
+            '2.0': 'two',
+            '2.5': 'two_half',
+            '3.0': 'three',
+            '3.5': 'three_half',
+            '4.0': 'four',
+            '4.5': 'four_half',
+            '5.0': 'five'
+        }
 
-    avg_rating = round(avg_rating, 6)
-    terrible_pct = round(terrible_pct, 6)
-    amazing_pct = round(amazing_pct, 6)
-    diff_pct = round(amazing_pct - terrible_pct, 6)
+        tbody = rating_section.find('tbody')
+        for i in range(1, 11):
+            stars = i / 2.0
+            dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
+            if dataspan:
+                datapoint = float(dataspan.find('span').xtext(True).replace('%', '')) / 100.0
+            else:
+                datapoint = 0.0
 
-    ratings['avg'] = avg_rating
-    ratings['total'] = num_ratings_tot
-    ratings['amazing_pct'] = amazing_pct
-    ratings['terrible_pct'] = terrible_pct
-    ratings['diff_pct'] = diff_pct
+            conv_rating = datapoint * stars
 
-    # - Ownership -#
+            star_str = 'rating_{}'.format(star_dict[str(stars)])
 
-    own_section = stats_data[1]
-    total_owns = own_section.find('figcaption').get_text(strip=True)
-    num_owns_tot = int(total_owns[total_owns.index(":") + 2:])
+            v[star_str] = round(datapoint, 6)
+            avg_rating += conv_rating
 
-    ownership = {'num_owners': num_owns_tot}
+            if i in (1, 2):
+                terrible_pct += datapoint
+            elif i in (9, 10):
+                amazing_pct += datapoint
 
-    # - Play -#
+        avg_rating = round(avg_rating, 6)
+        terrible_pct = round(terrible_pct, 6)
+        amazing_pct = round(amazing_pct, 6)
+        diff_pct = round(amazing_pct - terrible_pct, 6)
 
-    play_section = stats_data[2]
-    total_plays = play_section.find('figcaption').get_text(strip=True)
-    num_plays_tot = int(total_plays[total_plays.index(":") + 2: total_plays.index("-") - 1])
+        if num_ratings_tot is not None:
+            v['rating_votes'] = num_ratings_tot
+        v['rating_avg'] = avg_rating
+        v['rating_pct_amazing'] = amazing_pct
+        v['rating_pct_terrible'] = terrible_pct
+        v['rating_pct_diff'] = diff_pct
 
-    plays = {}
-    play_complete = 0.0
-    play_incomplete = 0.0
-    play_avg = 0.0
+        return v
 
-    tbody = play_section.find('tbody')
-    # todo check if some of these are missing
-    for i in range(1, 6):
-        dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
-        if dataspan:
-            datapoint = float(dataspan.findChild('span').get_text(strip=True).replace('%', '')) / 100.0
-        else:
-            datapoint = 0.0
+    def ownership(self):
+        own_section = self.soup_stats['figure'][1]
+        total_owns = own_section.find('figcaption').xtext()
+        if total_owns is not None:
+            total_owns = int(total_owns[total_owns.index(":") + 2:])
 
-        play_avg += (datapoint * i)
+        return total_owns
 
-        k = 'unk'
-        if i == 1:
-            k = 'once'
-        elif i == 2:
-            k = 'some'
-        elif i == 3:
-            k = 'half'
-        elif i == 4:
-            k = 'finish'
-        elif i == 5:
-            k = 'platinum'
+    def progress(self):
+        v = {}
 
-        plays[k] = round(datapoint, 6)
+        play_section = self.soup_stats['figure'][2]
 
-        if i in (1, 2, 3):
-            play_incomplete += datapoint
-        elif i in (4, 5):
-            play_complete += datapoint
+        total_plays = play_section.find('figcaption').xtext()
+        if total_plays is not None:
+            total_plays = int(total_plays[total_plays.index(":") + 2: total_plays.index("-") - 1])
 
-    plays['total'] = num_plays_tot
-    plays['complete_pct'] = round(play_complete, 6)
-    plays['incomplete_pct'] = round(play_incomplete, 6)
-    plays['avg'] = round(play_avg, 6)
+        play_complete = 0.0
+        play_incomplete = 0.0
+        play_avg = 0.0
 
-    # - Difficulty - #
+        tbody = play_section.find('tbody')
+        # todo check if some of these are missing
+        for i in range(1, 6):
+            dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
+            if dataspan:
+                datapoint = float(dataspan.find('span').xtext(True).replace('%', '')) / 100.0
+            else:
+                datapoint = 0.0
 
-    difficulty_section = stats_data[3]
-    total_difficulty = difficulty_section.find('figcaption').get_text(strip=True)
-    num_difficulty_tot = int(total_difficulty[total_difficulty.index(":") + 2: total_difficulty.index("-") - 1])
+            play_avg += (datapoint * i)
 
-    difficulty = {}
-    avg_difficulty = 0.0
+            k = 'unk'
+            if i == 1:
+                k = 'progress_pct_once'
+            elif i == 2:
+                k = 'progress_pct_some'
+            elif i == 3:
+                k = 'progress_pct_half'
+            elif i == 4:
+                k = 'progress_pct_finish'
+            elif i == 5:
+                k = 'progress_pct_platinum'
 
-    tbody = difficulty_section.find('tbody')
-    for i in range(1, 6):
-        dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
-        if dataspan:
-            datapoint = float(dataspan.findChild('span').get_text(strip=True).replace('%', '')) / 100.0
-        else:
-            datapoint = 0.0
+            v[k] = round(datapoint, 6)
 
-        avg_difficulty += (datapoint * i)
+            if i in (1, 2, 3):
+                play_incomplete += datapoint
+            elif i in (4, 5):
+                play_complete += datapoint
 
-        k = 'unk'
-        if i == 1:
-            k = 'easy'
-        elif i == 2:
-            k = 'fine'
-        elif i == 3:
-            k = 'moderate'
-        elif i == 4:
-            k = 'hard'
-        elif i == 5:
-            k = 'extreme'
+        if total_plays is not None:
+            v['progress_votes'] = total_plays
+        v['progress_avg'] = round(play_avg, 6)
+        v['progress_pct_complete'] = round(play_complete, 6)
+        v['progress_pct_incomplete'] = round(play_incomplete, 6)
 
-        difficulty[k] = round(datapoint, 6)
+        return v
 
-    difficulty['total'] = num_difficulty_tot
-    difficulty['avg'] = round(avg_difficulty, 6)
+    def difficulty(self):
+        v = {}
 
-    # - Time - #
+        difficulty_section = self.soup_stats['figure'][3]
 
-    times_section = stats_data[4]
-    total_times = times_section.find('figcaption').get_text(strip=True)
-    num_times_tot = int(total_times[total_times.index(":") + 2: total_times.index("-") - 1])
+        total_difficulty = difficulty_section.find('figcaption').xtext()
+        if total_difficulty is not None:
+            total_difficulty = int(total_difficulty[total_difficulty.index(":") + 2: total_difficulty.index("-") - 1])
 
-    times = {}
-    avg_times = 0.0
+        avg_difficulty = 0.0
 
-    tbody = times_section.find('tbody')
-    for i in range(1, 11):
-        dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
-        if dataspan:
-            datapoint = float(dataspan.findChild('span').get_text(strip=True).replace('%', '')) / 100.0
-        else:
-            datapoint = 0.0
+        tbody = difficulty_section.find('tbody')
+        for i in range(1, 6):
+            dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
+            if dataspan:
+                datapoint = float(dataspan.find('span').xtext(True).replace('%', '')) / 100.0
+            else:
+                datapoint = 0.0
 
-        hours = 0.0
-        if i == 1:
-            hours = 0.5
-        elif i == 2:
-            hours = 1.0
-        elif i == 3:
-            hours = 2.0
-        elif i == 4:
-            hours = 4.0
-        elif i == 5:
-            hours = 8.0
-        elif i == 6:
-            hours = 12.0
-        elif i == 7:
-            hours = 20.0
-        elif i == 8:
-            hours = 40.0
-        elif i == 9:
-            hours = 60.0
-        elif i == 10:
-            hours = 90.0
+            avg_difficulty += (datapoint * i)
 
-        times[str(hours)] = round(datapoint, 6)
-        avg_times += (datapoint * hours)
+            k = 'unk'
+            if i == 1:
+                k = 'difficulty_easy'
+            elif i == 2:
+                k = 'difficulty_fine'
+            elif i == 3:
+                k = 'difficulty_moderate'
+            elif i == 4:
+                k = 'difficulty_hard'
+            elif i == 5:
+                k = 'difficulty_extreme'
 
-    times['avg'] = round(avg_times, 6)
-    times['total'] = num_times_tot
+            v[k] = round(datapoint, 6)
 
-    # - all - #
+        v['difficulty_votes'] = total_difficulty
+        v['difficulty_avg'] = round(avg_difficulty, 6)
 
-    stats = {
-        'ratings': ratings,
-        'ownership': ownership,
-        'plays': plays,
-        'difficulty': difficulty,
-        'times': times
-    }
+        return v
 
-    stats_all = {'stats': stats}
+    def playtime(self):
+        v = {}
 
-    return stats_all
+        times_section = self.soup_stats['figure'][4]
 
+        total_times = times_section.find('figcaption').xtext()
+        if total_times is not None:
+            total_times = int(total_times[total_times.index(":") + 2: total_times.index("-") - 1])
 
-def get_game_playing(data_url):
-    g_data = get_new_page(False, data_url)
+        avg_times = 0.0
 
-    also_playing = []
-    also_own = []
-    also_love = []
+        hours_dict = {
+            '1': (0.5, 'playtime_pct_half_hour'),
+            '2': (1.0, 'playtime_pct_one_hour'),
+            '3': (2.0, 'playtime_pct_two_hour'),
+            '4': (4.0, 'playtime_pct_four_hour'),
+            '5': (8.0, 'playtime_pct_eight_hour'),
+            '6': (12.0, 'playtime_pct_twelve_hour'),
+            '7': (20.0, 'playtime_pct_twenty_hour'),
+            '8': (40.0, 'playtime_pct_forty_hour'),
+            '9': (60.0, 'playtime_pct_sixty_hour'),
+            '10': (90.0, 'playtime_pct_ninety_hour')
+        }
 
-    general_data = g_data.find_all('div', {'class': 'pod'})
+        tbody = times_section.find('tbody')
+        for i in range(1, 11):
+            dataspan = tbody.find('span', {'class': 'mygames_stat{}'.format(i)})
+            if dataspan:
+                datapoint = float(dataspan.find('span').xtext(True).replace('%', '')) / 100.0
+            else:
+                datapoint = 0.0
 
-    for g in general_data:
-        cols = g.find_all('div', {'class': 'table_col_5'})
-        header = g.find('div', {'class': 'head'}).find('h2').text.lower()
-        for c in cols:
-            chref = c.find('a').get('href')
-            game_url = add_base_url(chref)
-            game_name = c.get_text(strip=True)
-            cols_list = {
-                'name': game_name,
+            hours, hours_str = hours_dict.get(str(i), (0.0, None))
+
+            v[hours_str] = round(datapoint, 6)
+            avg_times += (datapoint * hours)
+
+        if total_times is not None:
+            v['playtime_votes'] = total_times
+        v['playtime_avg'] = round(avg_times, 6)
+
+        return v
+
+    def update_recommendations(self):
+        self._setif('game_recommendations', self.obj.game_recommendations.all() + self.also_playing())
+
+    def also_playing(self):
+        v = []
+
+        existing = self.obj.game_recommendations
+
+        general_data = self.soup_recommendations['main'].select('div div.pod').orelse([])
+        for g in general_data:
+            header = g.select_one('div.head h2').xtext(True).lower()
+            if 'also playing' in header:
+                typ = 'playing'
+            elif 'also own' in header:
+                typ = 'own'
+            elif 'also love' in header:
+                typ = 'love'
+            else:
+                self._log('-> Error: unknown header type for recommendation section: {}'.format(header), 'red')
+                continue
+
+            cols = g.find_all('div', {'class': 'table_col_5'}).orelse([])
+            for c in cols:
+                game_name = c.xtext()
+
+                game_url = c.find('a').xget('href')
+                if game_url is None:
+                    self._log('-> Error: could not get link for recommendation {}'.format(game_name))
+                    continue
+
+                game_url = add_base_url(game_url)
+
+                filter_dict = {
+                    'typ': typ,
+                    'url': game_url
+                }
+
+                filtered = existing.filter_by(**filter_dict)
+                filtered_len = filtered.count()
+                if filtered_len == 0:
+                    rec_obj = Game_Recommendation(**filter_dict)
+                    filter_dict['name'] = game_name
+                    self._setdictif(filter_dict, rec_obj)
+
+                    v.append(rec_obj)
+
+        typ = 'related'
+        rel_lis = self.soup_recommendations['main'].find('div', {'class': 'pod_related'}).select('div.body ul li').orelse([])
+        for rel_li in rel_lis:
+            rel_a = rel_li.find('a')
+
+            game_name = rel_a.find('h3').xtext()
+
+            game_url = rel_a.xget('href')
+            if game_url is None:
+                self._log('-> Error: could not get link for recommendation {}'.format(game_name))
+                continue
+
+            game_url = add_base_url(game_url)
+
+            filter_dict = {
+                'typ': typ,
                 'url': game_url
             }
 
-            if 'also playing' in header:
-                also_playing.append(cols_list)
-            elif 'also own' in header:
-                also_own.append(cols_list)
-            elif 'also love' in header:
-                also_love.append(cols_list)
+            filtered = existing.filter_by(**filter_dict)
+            filtered_len = filtered.count()
+            if filtered_len == 0:
+                rec_obj = Game_Recommendation(**filter_dict)
+                filter_dict['name'] = game_name
+                self._setdictif(filter_dict, rec_obj)
 
-    related_games = []
-    related_data = g_data.find('div', {'class': 'pod_related'})
-    if related_data:
-        rel_lis = related_data.select('div.body ul li')
-        for rel_li in rel_lis:
-            rel_a = rel_li.find('a')
-            rel_info = {
-                'name': rel_a.find('h3').get_text(strip=True),
-                'url': add_base_url(rel_a.get('href'))
-            }
-            related_games.append(rel_info)
+                v.append(rec_obj)
 
-    playing = {
-        'recommendations': {
-            'playing': also_playing,
-            'own': also_own,
-            'love': also_love,
-            'related': related_games
-        }
-    }
+        return v
 
-    return playing
+    @staticmethod
+    def commit():
+        if echo_changes:
+            get_changes()
+        if do_commit:
+            session.commit()
 
 
 def get_row_data(row_data):
     td = row_data.find_all('td')
 
     game = td[1]
-    name = game.get_text(strip=True)
+    name = game.xtext()
 
-    ghref = game.find('a').get('href')
+    ghref = game.find('a').xget('href')
     href = add_base_url(ghref)
     gid = get_game_id(ghref)
 
-    glen = td[4].get_text(strip=True)
+    glen = td[4].xtext()
 
     rdata = {
         'name': name,
         'gid': gid,
-        'href': href,
+        'url': href,
         'glen': glen
     }
 
     return rdata
 
 
-def parse_game_info(game_info, s=None):
-    game_href = game_info.get('href')
-    game_len = game_info.get('glen')
-    # todo description?
-
-    if game_len == '---' and s != 'iOS (iPhone/iPad)':
-        print('-> Length is blank, skipping...')
-        return False
-
-    del game_info['glen']
-    game_details = get_game_details(game_href)
-    if game_details is False:
-        return False
-    game_info.update(game_details)
-    game_info['platform'] = s  # todo: remove and also name
-
-    # print(json.dumps(game_info, indent=4, sort_keys=True))
-
-    return game_info
+# todo add game description?
 
 
-def update_game(i):
-    cursor.execute('SELECT 1 FROM game WHERE href = %s', (i['href'],))
-    if cursor.rowcount != 0:
-        print('-> Exists, skipping insert.')
-        return
+def db_get_exist_game(url):
+    db_game = session.query(Game).filter_by(url=url).first()
+    if db_game:
+        if rerun is False:
+            print('-> Exists, skipping insert ({})'.format(url))
+            db_game = None
+        else:
+            print('-> Found entry, rerunning ({})'.format(url))
+    else:
+        db_game = Game(url=url)
 
-    # - game - #
-
-    col_list = [
-        'name', 'href', 'gamefaqs_uid', 'platform', 'genre', 'aka', 'franchise_name', 'franchise_url', 'local_players', 'multi_players', 'metacritic_url', 'boxart_thumb', 'boxart_front', 'boxart_all', 'also_on', 'release_distribution_uid', 'release_product_uid', 'release_publisher_name', 'release_publisher_url', 'release_date', 'release_esrb_rating', 'release_title'
-    ]
-
-    da = i.get('data', {})
-
-    _franchise = da.get('franchise', {})
-    _boxart = da.get('boxart', {})
-    _release_us = da.get('release_us', {})
-
-    inputs = [
-        i['name'], i['href'], i['gid'], i['platform'], da['genre'], da['aka'], _franchise.get('name'), _franchise.get('url'), da['local_players'], da['multi_players'], da.get('metacritic', {}).get('url'), _boxart.get('thumb'), _boxart.get('front'), _boxart.get('all'), da['also_on'], _release_us.get('distribution_id'), _release_us.get('product_id'), _release_us.get('publisher', {}).get('name'), _release_us.get('publisher', {}).get('url'), _release_us.get('release_date'), _release_us.get('esrb_rating'), _release_us.get('title')
-    ]
-
-    input_s = ', '.join(['%s' for _ in col_list])
-
-    _game = sql.SQL('''
-        INSERT INTO game ({}) VALUES ({}) RETURNING id
-    '''.format('{}', input_s)).format(sql.SQL(', ').join([sql.Identifier(x) for x in col_list]))
-
-    cursor.execute(_game, inputs)
-    game_id = cursor.fetchone()['id']
-
-    # - game_stat - #
-
-    col_list = [
-        'game_id', 'owners', 'metacritic_rating', 'metacritic_reviews', 'difficulty_votes', 'difficulty_avg', 'difficulty_easy', 'difficulty_fine', 'difficulty_moderate', 'difficulty_hard', 'difficulty_extreme', 'progress_votes', 'progress_avg', 'progress_pct_complete', 'progress_pct_incomplete', 'progress_pct_platinum', 'progress_pct_finish', 'progress_pct_half', 'progress_pct_some', 'progress_pct_once', 'rating_votes', 'rating_avg', 'rating_half', 'rating_one', 'rating_one_half', 'rating_two', 'rating_two_half', 'rating_three', 'rating_three_half', 'rating_four', 'rating_four_half', 'rating_five', 'rating_pct_amazing', 'rating_pct_terrible', 'rating_pct_diff', 'playtime_votes', 'playtime_avg', 'playtime_pct_halfhour', 'playtime_pct_onehour', 'playtime_pct_twohour', 'playtime_pct_four_hour', 'playtime_pct_eight_hour', 'playtime_pct_twelve_hour', 'playtime_pct_twenty_hour', 'playtime_pct_forty_hour', 'playtime_pct_sixty_hour', 'playtime_pct_ninety_hour'
-    ]
-
-    st = i.get('stats', {})
-
-    _diff = st.get('difficulty', {})
-    _prog = st.get('plays', {})
-    _rate = st.get('ratings', {})
-    _play = st.get('times', {})
-
-    inputs = [
-        game_id, st.get('ownership', {}).get('num_owners'), da.get('metacritic', {}).get('rating'), da.get('metacritic', {}).get('reviews'), _diff.get('total'), _diff.get('avg'), _diff.get('easy'), _diff.get('fine'), _diff.get('moderate'), _diff.get('hard'), _diff.get('extreme'), _prog.get('total'), _prog.get('avg'), _prog.get('complete_pct'), _prog.get('incomplete_pct'), _prog.get('platinum'), _prog.get('finish'), _prog.get('half'), _prog.get('some'), _prog.get('once'), _rate.get('total'), _rate.get('avg'), _rate.get('0.5'), _rate.get('1.0'), _rate.get('1.5'), _rate.get('2.0'), _rate.get('2.5'), _rate.get('3.0'), _rate.get('3.5'), _rate.get('4.0'), _rate.get('4.5'), _rate.get('5.0'), _rate.get('amazing_pct'), _rate.get('terrible_pct'), _rate.get('diff_pct'), _play.get('total'), _play.get('avg'), _play.get('0.5'), _play.get('1.0'), _play.get('2.0'), _play.get('4.0'), _play.get('8.0'), _play.get('12.0'), _play.get('20.0'), _play.get('40.0'), _play.get('60.0'), _play.get('90.0')
-    ]
-
-    input_s = ', '.join(['%s' for _ in col_list])
-
-    _gamestat = sql.SQL('''
-        INSERT INTO game_stat ({}) VALUES ({})
-    '''.format('{}', input_s)).format(sql.SQL(', ').join([sql.Identifier(x) for x in col_list]))
-
-    cursor.execute(_gamestat, inputs)
-
-    # - game_esrb_content - #
-
-    eds = da.get('esrb_descriptions')
-    for ed in eds:
-        ed_id = esrb_content_list.get(ed)
-        if not ed_id:
-            cursor.execute('INSERT INTO esrb_content (name) VALUES (%s) RETURNING id', (ed,))
-            ed_id = cursor.fetchone()['id']
-            esrb_content_list[ed] = ed_id
-
-        cursor.execute('INSERT INTO game_esrb_content (game_id, esrb_content_id) VALUES (%s, %s)', (game_id, ed_id))
-
-    # - game_developer - #
-
-    devs = da.get('developers')
-    for dev, dev_url in devs.items():
-        dev_id = developer_list.get(dev)
-        if not dev_id:
-            cursor.execute('INSERT INTO developer (name, url) VALUES (%s, %s) RETURNING id', (dev, dev_url))
-            dev_id = cursor.fetchone()['id']
-            developer_list[dev] = dev_id
-
-        cursor.execute('INSERT INTO game_developer (game_id, developer_id) VALUES (%s, %s)', (game_id, dev_id))
-
-    # - game_release - #
-
-    col_list = [
-        'game_id', 'region', 'distribution_uid', 'product_uid', 'publisher_name', 'publisher_url', 'release_date', 'esrb_rating', 'title'
-    ]
-
-    input_s = ', '.join(['%s' for _ in col_list])
-
-    _game_release = sql.SQL('''
-        INSERT INTO game_release ({}) VALUES ({})
-    '''.format('{}', input_s)).format(sql.SQL(', ').join([sql.Identifier(x) for x in col_list]))
-
-    _releases = da.get('releases')
-    for rele in _releases:
-        inputs = [
-            game_id, rele.get('region'), rele.get('distribution_id'), rele.get('product_id'), rele.get('publisher', {}).get('name'), rele.get('publisher', {}).get('url'), rele.get('release_date'), rele.get('esrb_rating'), rele.get('title')
-        ]
-        cursor.execute(_game_release, inputs)
-
-    # - game_expansion - #
-
-    col_list = [
-        'game_id', 'gamefaqs_uid', 'name', 'description', 'esrb_rating', 'href', 'metacritic_rating', 'metacritic_reviews', 'metacritic_url', 'release_date', 'owners', 'rating_score', 'rating_votes', 'completed_pct', 'completed_votes', 'difficulty_desc', 'difficulty_pct', 'difficulty_votes', 'playtime_hours', 'playtime_votes'
-    ]
-
-    input_s = ', '.join(['%s' for _ in col_list])
-
-    _game_expansion = sql.SQL('''
-        INSERT INTO game_expansion ({}) VALUES ({})
-    '''.format('{}', input_s)).format(sql.SQL(', ').join([sql.Identifier(x) for x in col_list]))
-
-    ex = i.get('expansions', {})
-    for exp, exp_val in ex.items():
-        _metacritic = exp_val.get('metacritic', {})
-        _rating = exp_val.get('rating', {})
-        _completed = exp_val.get('completed', {})
-        _difficulty = exp_val.get('difficulty', {})
-        _playtime = exp_val.get('playtime', {})
-        inputs = [
-            game_id, exp_val.get('game_id'), exp, exp_val.get('description'), exp_val.get('esrb_rating'), exp_val.get('href'), _metacritic.get('rating'), _metacritic.get('reviews'), _metacritic.get('url'), exp_val.get('release_date'), exp_val.get('ownership_num'), _rating.get('avg'), _rating.get('total'), _completed.get('pct'), _completed.get('votes'), _difficulty.get('desc'), _difficulty.get('pct'), _difficulty.get('votes'), _playtime.get('len'), _playtime.get('total')
-        ]
-
-        cursor.execute(_game_expansion, inputs)
-
-    # - game_recommendation - #
-
-    col_list = [
-        'game_id', 'typ', 'name', 'url'
-    ]
-
-    input_s = ', '.join(['%s' for _ in col_list])
-
-    _game_recommendation = sql.SQL('''
-        INSERT INTO game_recommendation ({}) VALUES ({})
-    '''.format('{}', input_s)).format(sql.SQL(', ').join([sql.Identifier(x) for x in col_list]))
-
-    recs = i.get('recommendations', {})
-    for rec, d in recs.items():
-        for rec_item in d:
-            inputs = [
-                game_id, rec, rec_item.get('name'), rec_item.get('url')
-            ]
-            cursor.execute(_game_recommendation, inputs)
-
-    db.commit()
+    return db_game
 
 
 def get_system_pages(s):
@@ -1026,19 +1264,19 @@ def get_system_pages(s):
     if num_pages:
         last_page = start_page + num_pages
     else:
-        max_page = main_body.select_one('ul.paginate')
+        max_page = main_body.select_one('ul.paginate').xtext()
         if max_page:
-            last_page = int(max_page.get_text().strip().split('of ')[-1].split()[0])
+            last_page = int(max_page.split('of ')[-1].split()[0])
         else:
-            print('=> Error: Could not get max pages, using 1')
+            print(colored('=> Error: Could not get max pages, using 1', 'red'))
             last_page = 1
 
-    print('= {} ='.format(s))
+    print('\n= {} =\n'.format(s))
     print(' Total pages: {}'.format(last_page))
     games_parsed = 0
 
     for i in range(start_page, last_page):
-        print('- Page {} -'.format(i + 1))
+        print('\n- Page {} -\n'.format(i + 1))
         if i == 0:
             page_data = main_body
         else:
@@ -1046,13 +1284,13 @@ def get_system_pages(s):
 
         table_data = page_data.find('table', {'class': 'results'})
         if not table_data:
-            print('=> Error: could not parse main results page')
+            print(colored('=> Error: could not parse main results page', 'red'))
             break
 
-        row_data = table_data.find('tbody').find_all('tr')
+        row_data = table_data.find('tbody').find_all('tr').orelse([])
         for r in row_data:
             # noinspection PyTypeChecker
-            if max_games is not None and games_parsed > max_games:
+            if max_games is not None and games_parsed >= max_games:
                 print('-> max games hit')
                 return
 
@@ -1060,16 +1298,22 @@ def get_system_pages(s):
 
             print(game_info['name'])
 
-            cursor.execute('SELECT 1 FROM game WHERE href = %s', (game_info['href'],))
-            if cursor.rowcount != 0:
-                print('-> Exists, skipping insert.')
+            game_len = game_info['glen']
+            if game_len == '---' and s != 'iOS (iPhone/iPad)':
+                print('-> Length is blank, skipping...')
                 continue
 
-            game_full_info = parse_game_info(game_info, s)
-            if game_full_info is False:
+            db_game = db_get_exist_game(game_info['url'])
+            if db_game is None:
                 continue
 
-            update_game(game_full_info)
+            if not db_game.name:
+                db_game.name = game_info['name']
+                db_game.gamefaqs_uid = game_info['gid']
+                db_game.platform = s  # todo: put in db and make reference
+
+            p = get_game_details(db_game)
+            commit(p)
 
             games_parsed += 1
 
@@ -1077,68 +1321,56 @@ def get_system_pages(s):
 def get_one_page(url):
     url = add_base_url(url)
 
-    cursor.execute('SELECT 1 FROM game WHERE href = %s', (url,))
-    if cursor.rowcount != 0:
-        print('-> Exists, skipping insert ({})'.format(url))
+    db_game = db_get_exist_game(url)
+    if db_game is None:
         return
 
-    one_data = get_new_page(False, url)
+    if not db_game.name:
+        one_data = get_new_page(False, url)
 
-    page_header = one_data.select_one('header.page-header')
-    if not page_header:
-        print('=> Error: could not find game info')
-        return False
+        page_header = one_data.select_one('header.page-header')
+        if not page_header:
+            print(colored('=> Error: could not find game info', 'red'))
+            return
 
-    gid = get_game_id(url)
+        game_title = page_header.select_one('.page-title a').xtext()
+        if not game_title:
+            print(colored('=> Error: could not find game name', 'red'))
+            return
 
-    game_title = page_header.select_one('.page-title a')
-    if not game_title:
-        print('=> Error: could not find game name')
-        return False
+        game_sys = page_header.select_one('ol.crumbs li.top-crumb a').xtext()
+        if not game_sys:
+            print(colored('=> Error: could not find game system', 'red'))
+            return
 
-    name = game_title.get_text(strip=True)
+        db_game.name = game_title
+        db_game.platform = game_sys  # todo: put in db and make reference
+        db_game.gamefaqs_uid = get_game_id(url)
 
-    game_sys = page_header.select_one('ol.crumbs li.top-crumb a')
-    if not game_sys:
-        print('=> Error: could not find game system')
-        return False
+    p = get_game_details(db_game)
 
-    s = game_sys.get_text(strip=True)
-
-    game_info = {
-        'name': name,
-        'gid': gid,
-        'href': url,
-        'glen': None
-    }
-
-    game_full_info = parse_game_info(game_info, s)
-    if game_full_info is False:
-        return
-
-    update_game(game_full_info)
+    commit(p)
 
 
 esrb_content_list = {}
-cursor.execute('SELECT id, name FROM esrb_content')
-for ro in cursor.fetchall():
-    esrb_content_list[ro['name']] = ro['id']
+for ro in session.query(Esrb_Content):
+    esrb_content_list[ro.name] = ro
 
 developer_list = {}
-cursor.execute('SELECT id, name FROM developer')
-for ro in cursor.fetchall():
-    developer_list[ro['name']] = ro['id']
+for ro in session.query(Developer):
+    developer_list[ro.name] = ro
 
 
-if len(sys.argv) == 1:
-    for syst in systems:
-        get_system_pages(syst)
+if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        for syst in systems:
+            get_system_pages(syst)
 
-elif len(sys.argv) == 2:
-    game_urls = sys.argv[1].split(',')
-    for g_url in game_urls:
-        get_one_page(g_url)
+    elif len(sys.argv) == 2:
+        game_urls = sys.argv[1].split(',')
+        for g_url in game_urls:
+            get_one_page(g_url)
 
-else:
-    print('Too many arguments.')
-    sys.exit(1)
+    else:
+        print('Too many arguments.')
+        sys.exit(1)

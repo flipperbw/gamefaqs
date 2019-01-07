@@ -2,128 +2,146 @@ begin;
 
 
 create table game (
- id serial not null primary key,
- name varchar(1023),
- href varchar(1023),
- gamefaqs_uid int,
- platform varchar(256),
- genre varchar(1023),
- aka varchar(1023),
- franchise_name varchar(1023),
- franchise_url varchar(1023),
- local_players varchar(1023),
- multi_players varchar(1023),
- metacritic_url varchar(1023),
- boxart_thumb varchar(1023),
- boxart_front varchar(1023),
- boxart_all varchar(1023),
- also_on text[], --separate this into the actual id for platform
- -- change this whole thing to reference a specific release
- release_distribution_uid varchar(512),
- release_product_uid varchar(512),
- release_publisher_name varchar(1023),
- release_publisher_url varchar(1023),
- release_date date,
- release_esrb_rating varchar(31), -- change this to ID
- release_title varchar(1023)
+  id serial not null primary key,
+  name varchar(1023) not null,
+  url varchar(1023) not null,
+  platform varchar(256) not null,
+  gamefaqs_uid int not null,
+  genre varchar(1023) not null,
+  aka varchar(1023),
+  wiki varchar(1023),
+  franchise_name varchar(1023),
+  franchise_url varchar(1023),
+  local_players varchar(1023),
+  multi_players varchar(1023),
+  metacritic_url varchar(1023),
+  boxart_thumb varchar(1023),
+  boxart_front varchar(1023),
+  boxart_all varchar(1023),
+  also_on text[], --separate this into the actual id for platform
+  -- change this whole thing to reference a specific release
+  release_distribution_uid varchar(512),
+  release_product_uid varchar(512),
+  release_publisher_name varchar(1023),
+  release_publisher_url varchar(1023),
+  release_date date,
+  release_esrb_rating varchar(31), -- change this to ID
+  release_title varchar(1023),
+
+  UNIQUE(url),
+  UNIQUE(name, platform)
 );
 
 create table game_stat (
- id serial not null primary key,
- game_id int references game(id),
- owners int,
- metacritic_rating int,
- metacritic_reviews int,
- difficulty_votes int,
- difficulty_avg real,
- difficulty_easy real,
- difficulty_fine real,
- difficulty_moderate real,
- difficulty_hard real,
- difficulty_extreme real,
- progress_votes int,
- progress_avg real,
- progress_pct_complete real,
- progress_pct_incomplete real,
- progress_pct_platinum real,
- progress_pct_finish real,
- progress_pct_half real,
- progress_pct_some real,
- progress_pct_once real,
- rating_votes int,
- rating_avg real,
- rating_half real,
- rating_one real,
- rating_one_half real,
- rating_two real,
- rating_two_half real,
- rating_three real,
- rating_three_half real,
- rating_four real,
- rating_four_half real,
- rating_five real,
- rating_pct_amazing real,
- rating_pct_terrible real,
- rating_pct_diff real, -- no real point to these, can be calced (1+2, 9+10, then diff)
- playtime_votes int,
- playtime_avg real,
- playtime_pct_halfhour real,
- playtime_pct_onehour real,
- playtime_pct_twohour real,
- playtime_pct_four_hour real,
- playtime_pct_eight_hour real,
- playtime_pct_twelve_hour real,
- playtime_pct_twenty_hour real,
- playtime_pct_forty_hour real,
- playtime_pct_sixty_hour real,
- playtime_pct_ninety_hour real
+  id serial not null primary key,
+  game_id int not null references game(id) ON DELETE CASCADE,
+  owners int,
+  metacritic_rating int,
+  metacritic_reviews int,
+  difficulty_votes int,
+  difficulty_avg real,
+  difficulty_easy real,
+  difficulty_fine real,
+  difficulty_moderate real,
+  difficulty_hard real,
+  difficulty_extreme real,
+  progress_votes int,
+  progress_avg real,
+  progress_pct_complete real,
+  progress_pct_incomplete real,
+  progress_pct_platinum real,
+  progress_pct_finish real,
+  progress_pct_half real,
+  progress_pct_some real,
+  progress_pct_once real,
+  rating_votes int,
+  rating_avg real,
+  rating_half real,
+  rating_one real,
+  rating_one_half real,
+  rating_two real,
+  rating_two_half real,
+  rating_three real,
+  rating_three_half real,
+  rating_four real,
+  rating_four_half real,
+  rating_five real,
+  rating_pct_amazing real,
+  rating_pct_terrible real,
+  rating_pct_diff real, -- no real point to these, can be calced (1+2, 9+10, then diff)
+  playtime_votes int,
+  playtime_avg real,
+  playtime_pct_half_hour real,
+  playtime_pct_one_hour real,
+  playtime_pct_two_hour real,
+  playtime_pct_four_hour real,
+  playtime_pct_eight_hour real,
+  playtime_pct_twelve_hour real,
+  playtime_pct_twenty_hour real,
+  playtime_pct_forty_hour real,
+  playtime_pct_sixty_hour real,
+  playtime_pct_ninety_hour real,
+
+  UNIQUE(game_id)
 );
 
 create table esrb_content (
   id serial not null primary key,
-  name varchar(255),
-  description varchar(2047)
+  name varchar(255) not null,
+  description varchar(2047),
+
+  UNIQUE(name)
 );
 
 create table game_esrb_content (
- id serial not null primary key,
- game_id int references game(id),
- esrb_content_id int references esrb_content(id)
+  id serial not null primary key,
+  game_id int not null references game(id) ON DELETE CASCADE,
+  esrb_content_id int not null references esrb_content(id) ON DELETE CASCADE,
+
+  UNIQUE(game_id, esrb_content_id)
 );
 
 create table developer (
   id serial not null primary key,
-  name varchar(255),
-  url varchar(1023)
+  name varchar(255) not null,
+  url varchar(1023) not null,
+
+  UNIQUE(url),
+  UNIQUE(name)
 );
 
 create table game_developer (
- id serial not null primary key,
- game_id int references game(id),
- developer_id int references developer(id)
+  id serial not null primary key,
+  game_id int not null references game(id) ON DELETE CASCADE,
+  developer_id int not null references developer(id) ON DELETE CASCADE,
+
+  UNIQUE(game_id, developer_id)
 );
 
 create table game_release (
- id serial not null primary key,
- game_id int references game(id),
- region varchar(31),
- distribution_uid varchar(512),
- product_uid varchar(512),
- publisher_name varchar(1023),
- publisher_url varchar(1023),
- release_date date,
- esrb_rating varchar(31), -- change this to ID
- title varchar(1023)
+  id serial not null primary key,
+  game_id int not null references game(id) ON DELETE CASCADE,
+  title varchar(1023) not null,
+  region varchar(31) not null,
+  distribution_uid varchar(512),
+  product_uid varchar(512),
+  publisher_name varchar(1023),
+  publisher_url varchar(1023),
+  release_date date,
+  esrb_rating varchar(31) -- change this to ID
 );
+
+create unique index idx_game_release_unique on game_release
+  (game_id, region, title, coalesce(distribution_uid, ''), coalesce(product_uid, ''), coalesce(publisher_name, ''), coalesce(publisher_url, ''), coalesce(release_date, ''), coalesce(esrb_rating, ''));
 
 create table game_expansion (
   id serial not null primary key,
-  game_id int references game(id),
-  gamefaqs_uid int,
-  name varchar(1023),
-  description varchar(2047),
+  game_id int not null references game(id) ON DELETE CASCADE,
+  name varchar(1023) not null,
+  url varchar(1023) not null,
+  gamefaqs_uid int not null,
+  description varchar(2047) not null,
   esrb_rating varchar(31), -- change this to ID
-  href varchar(1023),
   metacritic_rating int,
   metacritic_reviews int,
   metacritic_url varchar(1023),
@@ -137,18 +155,31 @@ create table game_expansion (
   difficulty_pct real,
   difficulty_votes int,
   playtime_hours real,
-  playtime_votes int
+  playtime_votes int,
+
+  UNIQUE(url)
 );
 
 create table game_recommendation (
   id serial not null primary key,
-  game_id int references game(id),
-  typ varchar(63),
-  name varchar(1023), --maybe make this a reference
-  url varchar(1023)
+  game_id int not null references game(id) ON DELETE CASCADE,
+  typ varchar(63) not null, -- own, related, playing, love
+  name varchar(1023) not null, --maybe make this a reference
+  url varchar(1023) not null,
+
+  UNIQUE(game_id, typ, url)
 );
 
---unique index name platform
+create table game_compilation (
+  id serial not null primary key,
+  game_id int not null references game(id) ON DELETE CASCADE,
+  typ varchar(31) not null, -- within, contains
+  name varchar(1023) not null,
+  platform varchar(256) not null,
+  url varchar(1023) not null,
+
+  UNIQUE(game_id, url)
+);
 
 
 CREATE OR REPLACE FUNCTION update_modified()
