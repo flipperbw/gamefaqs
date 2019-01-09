@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 
 from datetime import datetime
-# import json
 import re
 import sys
 from time import sleep
 
 # noinspection PyProtectedMember
 from bs4 import (
-    #Comment,
-    SoupStrainer
+    SoupStrainer,
+    NavigableString,
+    Comment,
+    CData,
+    ProcessingInstruction,
+    Doctype
 )
 import soupy
 from dateutil.parser import parse as dateparse
-#from pprint import pprint
+from pprint import pprint
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
@@ -56,12 +59,13 @@ start_page = 0
 #num_pages = False
 num_pages = 40
 #max_games = None
-max_games = 1
+max_games = 2
 
 rerun = True
 
-echo_changes = True
-do_commit = True
+# TODO: implement logging
+debug = True
+do_commit = False
 
 db = psycopg2.connect(host="localhost", user="brett", password="", database="gamefaqs")
 cursor = db.cursor(cursor_factory=RealDictCursor)
@@ -230,8 +234,13 @@ def wait_request(href):
 
 
 class XNode(soupy.Node):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __new__(cls, value, *args, **kwargs):
+        if isinstance(value, NavigableString):
+            o = object.__new__(soupy.NavigableStringNode)
+            o._value = value
+            return o
+
+        return object.__new__(cls)
 
     def xtext(self, default=False):
         t = self.text
@@ -252,9 +261,6 @@ class XNode(soupy.Node):
 
 
 class XNullNode(soupy.NullNode):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     @staticmethod
     def xtext(default=False):
         if default:
@@ -276,12 +282,13 @@ soupy.NullNode = XNullNode
 
 
 def clean_soup(soup):
-    for script in soup(["script", "link", "style", "noscript", "meta"]):
-        script.val().extract()
-    #for comment in soup.find_all(text=lambda t: isinstance(t, Comment)):
-    #    comment.val().extract()
+    # https://developer.mozilla.org/en-US/docs/Web/HTML/Element
+    for script in soup(["head", "script", "link", "style", "noscript", "meta", "iframe"]):
+        script.val().decompose()
+    for comment in soup.find_all(string=lambda t: isinstance(t, (Comment, CData, ProcessingInstruction, Doctype))):
+        comment.val().extract()
     for bad in soup.select('#mygames_nouser_dialog'):
-        bad.val().extract()
+        bad.val().decompose()
     return soup
 
 
@@ -290,7 +297,7 @@ def get_soup(url):
         return soupy.Soupy('', 'lxml')
     d = wait_request(url)
     soup = clean_soup(soupy.Soupy(d, 'lxml', parse_only=strainer))
-    return soup.find('div', attrs={'class': 'main_content'})
+    return soup.find('div', {'class': 'main_content'})
 
 
 def get_new_page(i, system_url):
@@ -358,7 +365,9 @@ def get_changes():
 def get_game_details(db_game):
     p = Parser(db_game)
     p.update_all()
-    #pprint(vars(p.obj))
+
+    if debug:
+        pprint(vars(p.obj))
 
     return p
 
@@ -476,7 +485,7 @@ class Parser:
         return self.soup_data['main'].select_one('div.pod_gamespace .game_desc .desc').xtext()
 
     def release_date(self):
-        release = self.soup_data['up_right'].find('b', text=re_comp.get('release')).find_next_sibling('a').xtext()
+        release = self.soup_data['up_right'].find('b', string=re_comp.get('release')).find_next_sibling('a').xtext()
         if release is None:
             return None
 
@@ -636,7 +645,7 @@ class Parser:
         #TODO: function replacing if X is none...
 
     def _check_expansion(self):
-        expansion_b = self.soup_data['up_right'].find('b', text=re_comp.get('expansion'))
+        expansion_b = self.soup_data['up_right'].find('b', string=re_comp.get('expansion'))
         if expansion_b:
             return self._log('=> Error: is DLC, skipping...', 'magenta')
         else:
@@ -659,7 +668,7 @@ class Parser:
     def franchise(self):
         v = {}
 
-        franchise_b = self.soup_data['up_right'].find('b', text=re_comp.get('franchise')).find_next_sibling('a')
+        franchise_b = self.soup_data['up_right'].find('b', string=re_comp.get('franchise')).find_next_sibling('a')
         f_txt = franchise_b.xtext()
         if f_txt is not None:
             v['franchise_name'] = f_txt
@@ -672,7 +681,7 @@ class Parser:
     def also_on(self):
         # todo get system aliases
         alsoon = None
-        alsoon_b = self.soup_data['up_right'].find('b', text=re_comp.get('also')).find_next_siblings()
+        alsoon_b = self.soup_data['up_right'].find('b', string=re_comp.get('also')).find_next_siblings()
         if alsoon_b:
             alsoon = [a.xtext() for a in alsoon_b]
 
@@ -681,24 +690,24 @@ class Parser:
     def aka(self):
         # todo: multiple? (they are split on commas, but the string contains commas anyway
         # todo: combine this somehow
-        return self.soup_data['up_right'].find('b', text=re_comp.get('aka')).find_next_sibling('i').xtext()
+        return self.soup_data['up_right'].find('b', string=re_comp.get('aka')).find_next_sibling('i').xtext()
 
     def genre(self):
-        return self.soup_data['general'].find('dt', text=re_comp.get('genre')).find_next_sibling('dd').xtext()
+        return self.soup_data['general'].find('dt', string=re_comp.get('genre')).find_next_sibling('dd').xtext()
     
     def local_players(self):
-        return self.soup_data['general'].find('dt', text=re_comp.get('local_players')).find_next_sibling('dd').xtext()
+        return self.soup_data['general'].find('dt', string=re_comp.get('local_players')).find_next_sibling('dd').xtext()
 
     def multi_players(self):
-        return self.soup_data['general'].find('dt', text=re_comp.get('multi_players')).find_next_sibling('dd').xtext()
+        return self.soup_data['general'].find('dt', string=re_comp.get('multi_players')).find_next_sibling('dd').xtext()
 
     def wiki(self):
-        return self.soup_data['general'].find('dt', text=re_comp.get('wiki')).find_next_sibling('dd').xtext()
+        return self.soup_data['general'].find('dt', string=re_comp.get('wiki')).find_next_sibling('dd').xtext()
 
     def developers(self):
         v = []
 
-        developer_bs = self.soup_data['general'].find_all('dt', text=re_comp.get('developer')).orelse([])
+        developer_bs = self.soup_data['general'].find_all('dt', string=re_comp.get('developer')).orelse([])
         for developer_b in developer_bs:
             developer_data = developer_b.find_next_sibling('dd')
 
@@ -726,7 +735,7 @@ class Parser:
     def esrb_contents(self):
         v = []
 
-        esrb_b = self.soup_data['general'].find('dt', text=re_comp.get('esrb')).find_next_sibling('dd').xtext()
+        esrb_b = self.soup_data['general'].find('dt', string=re_comp.get('esrb')).find_next_sibling('dd').xtext()
         if esrb_b is not None:
             for ec in esrb_b.split(','):
                 ec_name = ec.strip()
@@ -829,7 +838,7 @@ class Parser:
         existing = self.obj.game_compilations
 
         for comp_type, comp_name in comp_dict.items():
-            compl_included = self.soup_data['main'].find('h2', text=comp_type).parent.find_next_sibling('div', {'class': 'body'}).find_all('tr').orelse([])
+            compl_included = self.soup_data['main'].find('h2', string=comp_type).parent.find_next_sibling('div', {'class': 'body'}).find_all('tr').orelse([])
             for tr in compl_included:
                 tds = tr.find_all('td')
                 if len(tds) >= 2:
@@ -1209,7 +1218,7 @@ class Parser:
 
     @staticmethod
     def commit():
-        if echo_changes:
+        if debug:
             get_changes()
         if do_commit:
             session.commit()
@@ -1352,16 +1361,19 @@ def get_one_page(url):
     commit(p)
 
 
-esrb_content_list = {}
-for ro in session.query(Esrb_Content):
-    esrb_content_list[ro.name] = ro
-
-developer_list = {}
-for ro in session.query(Developer):
-    developer_list[ro.name] = ro
-
-
 if __name__ == '__main__':
+    if len(sys.argv) > 2:
+        print('Too many arguments.')
+        sys.exit(1)
+
+    esrb_content_list = {}
+    for ro in session.query(Esrb_Content):
+        esrb_content_list[ro.name] = ro
+
+    developer_list = {}
+    for ro in session.query(Developer):
+        developer_list[ro.name] = ro
+
     if len(sys.argv) == 1:
         for syst in systems:
             get_system_pages(syst)
@@ -1370,7 +1382,3 @@ if __name__ == '__main__':
         game_urls = sys.argv[1].split(',')
         for g_url in game_urls:
             get_one_page(g_url)
-
-    else:
-        print('Too many arguments.')
-        sys.exit(1)
