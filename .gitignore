@@ -1,6 +1,0 @@
-*.sw[op]
-*.bak
-.idea
-*.bu
-*.log
-__pycache__
